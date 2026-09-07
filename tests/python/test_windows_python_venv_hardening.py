@@ -47,20 +47,81 @@ def _link_dir(link: Path, target: Path) -> None:
         os.symlink(target, link, target_is_directory = True)
 
 
+# install.ps1 and studio/setup.ps1 both open with these three lines, so a real run always emits UTF-8. A script that
+# only borrows their functions never executes that preamble, and then the child's stdout is whatever code page the
+# host console happens to be on. Pinned here rather than per test: it costs nothing on an ASCII script.
+_UTF8_STDOUT = """\
+$_UnslothUtf8NoBom = New-Object System.Text.UTF8Encoding $false
+try { [Console]::OutputEncoding = $_UnslothUtf8NoBom } catch { }
+$OutputEncoding = $_UnslothUtf8NoBom
+"""
+
+
 def _run_powershell(shell: str, script: str, env: dict[str, str]) -> str:
     # run_pwsh, not subprocess.run: $shell is always pwsh or powershell (see POWERSHELLS), and every venv and rollback
     # case in this file reads its stdout, so an interpreter that died at startup would surface as install.ps1 losing
     # half a moved environment.
     # See tests/_shared/unsloth_pwsh_runner.py.
     result = run_pwsh(
-        [shell, "-NoProfile", "-NonInteractive", "-Command", script],
+        [shell, "-NoProfile", "-NonInteractive", "-Command", _UTF8_STDOUT + script],
         check = True,
         capture_output = True,
         text = True,
+        # Explicit, because `text = True` alone decodes with the locale encoding, and on Windows that is the ANSI code
+        # page (cp1252 on the runners) rather than UTF-8. PowerShell writes the accented path as UTF-8, so the default
+        # turned one U+00E4 into U+00C3 U+00A4 and read as install.ps1 corrupting a marker it had restored correctly.
+        encoding = "utf-8",
+        errors = "strict",
         env = env,
         timeout = 30,
     )
     return result.stdout.strip()
+
+
+def _assert_same_text(actual: str, expected: str, note: str) -> None:
+    """`actual == expected`, but a mismatch names the codepoints that differ.
+
+    A bare `==` between two paths that differ in one accented character is unreadable in
+    CI: pytest renders its diff through the same stdout that mangled the string, so on a
+    non-UTF-8 console one side comes back as U+FFFD and the report accuses the half that
+    was right. Codepoints survive any code page, so they are what gets printed.
+    """
+    if actual == expected:
+        return
+    head = len(os.path.commonprefix([actual, expected]))
+
+    def describe(text: str) -> str:
+        shown = text[:24]
+        codepoints = " ".join(f"U+{ord(ch):04X}" for ch in shown)
+        return f"{shown!r}  [{codepoints}{' ...' if len(text) > len(shown) else ''}]"
+
+    lines = [
+        note,
+        f"  first {head} characters match, then:",
+        f"    actual   {describe(actual[head:])}",
+        f"    expected {describe(expected[head:])}",
+    ]
+    # Only claim a cause when the bytes show one. A wrong explanation on a real restore bug
+    # costs more than none: mojibake is the actual reading as expected's UTF-8 bytes back
+    # through a single-byte code page, so test that directly rather than pattern-matching.
+    if _looks_like_a_mis_decode(actual[head:], expected[head:]):
+        lines.append(
+            "  actual is expected's UTF-8 bytes decoded as a single-byte code page, i.e. this "
+            "shell's stdout was read with the Windows ANSI code page. The script did not lose "
+            "the path."
+        )
+    raise AssertionError("\n".join(lines))
+
+
+def _looks_like_a_mis_decode(actual: str, expected: str) -> bool:
+    """True when `actual` is `expected` encoded UTF-8 and decoded through a legacy code page."""
+    for codec in ("cp1252", "latin-1", "cp437", "cp850"):
+        try:
+            if expected.encode("utf-8").decode(codec) == actual:
+                return True
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            continue
+    return False
 
 
 def _uv_cache_functions(source: str) -> str:
@@ -856,7 +917,7 @@ Restore-StudioUvCacheMarker -StudioRoot $env:TEST_STUDIO_HOME
     env["TEST_MARKER"] = str(marker)
     result = json.loads(_run_powershell(shell, script, env).splitlines()[-1])
 
-    assert result["After"] == expected, result
+    _assert_same_text(result["After"], expected, "the rollback did not restore the marker it saved")
 
 
 @pytest.mark.skipif(not POWERSHELLS, reason = "PowerShell is unavailable")
